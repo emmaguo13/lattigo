@@ -60,10 +60,14 @@ func main() {
 	}
 
 	cases := []vecCase{
-		{name: "identical", aSeed: 1, bSeed: 1, scaleB: 1},      // cosine ~1
-		{name: "opposite", aSeed: 2, bSeed: 2, scaleB: -1},      // cosine ~-1
-		{name: "distinct", aSeed: 3, bSeed: 4, scaleB: 1},       // general position
-		{name: "mixed-scale", aSeed: 5, bSeed: 6, scaleB: 0.42}, // scaled variant
+		{name: "identical", aSeed: 1, bSeed: 1, scaleB: 1},       // cosine ~1
+		{name: "opposite", aSeed: 2, bSeed: 2, scaleB: -1},       // cosine ~-1
+		{name: "distinct", aSeed: 3, bSeed: 4, scaleB: 1},        // general position
+		{name: "mixed-scale", aSeed: 5, bSeed: 6, scaleB: 0.42},  // scaled variant
+		{name: "sparse-a", aSeed: 7, bSeed: 8, scaleB: 1},        // later slots zeroed
+		{name: "sparse-b", aSeed: 9, bSeed: 10, scaleB: 1},       // mirror sparse distribution
+		{name: "long-tail", aSeed: 11, bSeed: 12, scaleB: 0.7},   // more variance
+		{name: "tiny-scale", aSeed: 13, bSeed: 14, scaleB: 1e-2}, // very small magnitude
 	}
 
 	eval := ckks.NewEvaluator(params, evk)
