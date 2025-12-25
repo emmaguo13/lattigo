@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
-	"time"
 
 	"github.com/tuneinsight/lattigo/v6/core/rlwe"
 	"github.com/tuneinsight/lattigo/v6/multiparty"
@@ -19,7 +19,8 @@ func main() {
 	check(err)
 
 	// N parties
-	// todo(emma): does lattigo support an unlimited N? 
+	// Supports arbitrary N in principle, but practical limits related to performance and memory limit the actual size.
+	// Stay in the low hundreds.
 	parties := 3
 	crs, err := sampling.NewKeyedPRNG([]byte("pnns-example"))
 	check(err)
@@ -33,9 +34,9 @@ func main() {
 
 	// Generate a collective public key.
 	pk := genCollectivePK(params, crs, sks)
-	// todo(emma): what is collective relin? 
+	// Generate the collective relinearization key. Allows you to shrink the ciphertext back to degree-1 after multiplication
 	rlk := genCollectiveRelin(params, crs, sks)
-	// todo(emma): what are the galois elements for inner sum? 
+	// Uses Galois elements for inner sum
 	galEls := params.GaloisElementsForInnerSum(1, 120) // rotations for summing first 120 slots
 	galKeys := genCollectiveRotations(params, crs, sks, galEls)
 
@@ -44,65 +45,79 @@ func main() {
 	encoder := ckks.NewEncoder(params)
 	encryptor := rlwe.NewEncryptor(params, pk)
 
-	// Toy embeddings: first 120 slots hold random values, rest are zero.
-	rand.Seed(time.Now().UnixNano())
-	fill := func() []complex128 {
-		slots := params.MaxSlots()
-		v := make([]complex128, slots)
-		for i := 0; i < 120 && i < slots; i++ {
-			v[i] = complex(rand.NormFloat64(), 0)
-		}
-		return v
+	// Deterministic test vectors so we can compare decrypted cosine to plaintext cosine.
+	slotsToUse := 120
+	if slotsToUse > params.MaxSlots() {
+		slotsToUse = params.MaxSlots()
 	}
 
-	// Generate two embeddings. Realistically we have an embedding per party member.
-	ptA := ckks.NewPlaintext(params, params.MaxLevel())
-	ptB := ckks.NewPlaintext(params, params.MaxLevel())
-	check(encoder.Encode(fill(), ptA))
-	check(encoder.Encode(fill(), ptB))
+	type vecCase struct {
+		name      string
+		aSeed     int64
+		bSeed     int64
+		scaleB    float64
+		expectCos float64
+	}
 
-	ctA, err := encryptor.EncryptNew(ptA)
-	check(err)
-	ctB, err := encryptor.EncryptNew(ptB)
-	check(err)
+	cases := []vecCase{
+		{name: "identical", aSeed: 1, bSeed: 1, scaleB: 1},      // cosine ~1
+		{name: "opposite", aSeed: 2, bSeed: 2, scaleB: -1},      // cosine ~-1
+		{name: "distinct", aSeed: 3, bSeed: 4, scaleB: 1},       // general position
+		{name: "mixed-scale", aSeed: 5, bSeed: 6, scaleB: 0.42}, // scaled variant
+	}
 
 	eval := ckks.NewEvaluator(params, evk)
-
-	// Dot product
-	prod, err := eval.MulRelinNew(ctA, ctB)
-	check(err)
-	check(eval.Rescale(prod, prod))
-
-	// todo(emma): make sure we are doing all of this with the shared public key.
-	dot := ckks.NewCiphertext(params, 1, prod.Level())
-	check(eval.RotateAndAdd(prod, 1, 120, dot)) // sum first 120 slots into every slot
-
-	// Norms
-	normA, err := eval.MulRelinNew(ctA, ctA)
-	check(err)
-	check(eval.Rescale(normA, normA))
-	check(eval.RotateAndAdd(normA, 1, 120, normA))
-
-	normB, err := eval.MulRelinNew(ctB, ctB)
-	check(err)
-	check(eval.Rescale(normB, normB))
-	check(eval.RotateAndAdd(normB, 1, 120, normB))
-
-	// For demo purposes we decrypt with the aggregated secret key (t-out-of-t).
 	aggSk := aggregateSecret(params, sks)
 	decryptor := rlwe.NewDecryptor(params, aggSk)
 
-	printSlot := func(label string, ct *rlwe.Ciphertext) {
-		pt := decryptor.DecryptNew(ct)
-		out := make([]complex128, params.MaxSlots())
-		check(encoder.Decode(pt, out))
-		fmt.Printf("%s (slot 0): %.4f\n", label, real(out[0]))
+	for _, tc := range cases {
+		vecA := genVector(params.MaxSlots(), slotsToUse, tc.aSeed)
+		vecB := scaleVector(genVector(params.MaxSlots(), slotsToUse, tc.bSeed), tc.scaleB)
+		plainCos := cosine(vecA, vecB, slotsToUse)
+
+		ptA := ckks.NewPlaintext(params, params.MaxLevel())
+		ptB := ckks.NewPlaintext(params, params.MaxLevel())
+		check(encoder.Encode(vecA, ptA))
+		check(encoder.Encode(vecB, ptB))
+
+		ctA, err := encryptor.EncryptNew(ptA)
+		check(err)
+		ctB, err := encryptor.EncryptNew(ptB)
+		check(err)
+
+		prod, err := eval.MulRelinNew(ctA, ctB)
+		check(err)
+		check(eval.Rescale(prod, prod))
+
+		dot := ckks.NewCiphertext(params, 1, prod.Level())
+		check(eval.RotateAndAdd(prod, 1, slotsToUse, dot)) // sum first slotsToUse slots into every slot
+
+		normA, err := eval.MulRelinNew(ctA, ctA)
+		check(err)
+		check(eval.Rescale(normA, normA))
+		check(eval.RotateAndAdd(normA, 1, slotsToUse, normA))
+
+		normB, err := eval.MulRelinNew(ctB, ctB)
+		check(err)
+		check(eval.Rescale(normB, normB))
+		check(eval.RotateAndAdd(normB, 1, slotsToUse, normB))
+
+		decode := func(ct *rlwe.Ciphertext) float64 {
+			pt := decryptor.DecryptNew(ct)
+			out := make([]complex128, params.MaxSlots())
+			check(encoder.Decode(pt, out))
+			return real(out[0])
+		}
+
+		dotDec := decode(dot)
+		normADec := decode(normA)
+		normBDec := decode(normB)
+		cosDec := dotDec / (math.Sqrt(normADec) * math.Sqrt(normBDec))
+
+		fmt.Printf("[%s] cos(enc)=%.6f cos(plain)=%.6f diff=%.6f\n", tc.name, cosDec, plainCos, math.Abs(cosDec-plainCos))
 	}
 
-	printSlot("dot", dot)
-	printSlot("normA", normA)
-	printSlot("normB", normB)
-	fmt.Println("Homomorphic cosine similarity can be obtained as dot / (sqrt(normA)*sqrt(normB)) either in the clear or via polynomial approx.")
+	fmt.Println("Cosine similarity can be obtained as dot / (sqrt(normA)*sqrt(normB)); results above compare encrypted vs plaintext.")
 }
 
 // genCollectivePK runs the CKG protocol.
@@ -189,6 +204,35 @@ func aggregateSecret(params ckks.Parameters, sks []*rlwe.SecretKey) *rlwe.Secret
 		r.Add(sum.Value, sks[i].Value, sum.Value)
 	}
 	return sum
+}
+
+func genVector(maxSlots, n int, seed int64) []complex128 {
+	rng := rand.New(rand.NewSource(seed))
+	v := make([]complex128, maxSlots)
+	for i := 0; i < n && i < maxSlots; i++ {
+		v[i] = complex(rng.NormFloat64(), 0)
+	}
+	return v
+}
+
+func scaleVector(in []complex128, scale float64) []complex128 {
+	out := make([]complex128, len(in))
+	for i, v := range in {
+		out[i] = complex(scale*real(v), scale*imag(v))
+	}
+	return out
+}
+
+func cosine(a, b []complex128, n int) float64 {
+	var dot, normA, normB float64
+	for i := 0; i < n && i < len(a) && i < len(b); i++ {
+		ra := real(a[i])
+		rb := real(b[i])
+		dot += ra * rb
+		normA += ra * ra
+		normB += rb * rb
+	}
+	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
 func check(err error) {
